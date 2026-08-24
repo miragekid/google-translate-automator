@@ -1,0 +1,18 @@
+﻿# Virtual environment
+venv/
+
+# Browser profile (sesi login, jangan di-upload)
+edge_profile/
+
+# Folder kerja
+mentah/
+hasil/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
