@@ -47,6 +47,7 @@ DIR_SELESAI  = "mentah/selesai"
 NUM_TABS     = 5           # Optimal 4-5 tab agar tidak kena antrean/rate-limit Google
 MAX_RETRIES  = 3           # Maksimal percobaan per file (termasuk refresh)
 TRANSLATE_TIMEOUT = 25     # Timeout tunggu terjemahan dalam detik
+HEADLESS     = True        # True = browser berjalan di background (hanya CLI yang tampil)
 
 console = Console()
 
@@ -301,7 +302,7 @@ async def amain():
     # Tampilkan banner header
     console.print(Panel.fit(
         "[bold cyan]GOOGLE TRANSLATE AUTOMATOR[/bold cyan]\n"
-        "[dim]Mode Paralel Tab • Fast DOM Lifecycle • Clean Progress CLI[/dim]",
+        "[dim]Mode Headless (Background) • Paralel Tab • Clean Progress CLI[/dim]",
         border_style="cyan"
     ))
 
@@ -336,7 +337,7 @@ async def amain():
         context = await p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             channel="msedge",
-            headless=False,
+            headless=HEADLESS,
             accept_downloads=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
