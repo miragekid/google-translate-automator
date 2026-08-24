@@ -44,8 +44,8 @@ except ImportError:
 DIR_MENTAH   = "mentah"
 DIR_HASIL    = "hasil"
 DIR_SELESAI  = "mentah/selesai"
-NUM_TABS     = 5           # Optimal 4-5 tab agar tidak kena antrean/rate-limit Google
-MAX_RETRIES  = 3           # Maksimal percobaan per file (termasuk refresh)
+NUM_TABS     = 5           # Jumlah tab paralel (sangat cepat ~2 detik per file)
+MAX_RETRIES  = 3           # Maksimal percobaan per file
 TRANSLATE_TIMEOUT = 25     # Timeout tunggu terjemahan dalam detik
 HEADLESS     = True        # True = browser berjalan di background (hanya CLI yang tampil)
 
@@ -66,55 +66,68 @@ def _listen_abort():
         time.sleep(0.05)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def dismiss_popups(page):
-    """Menutup banner/dialog announcement Google Translate jika ada."""
-    try:
-        popup_btn = page.locator('button:has-text("Got it"), button:has-text("I agree"), button:has-text("Accept all"), button:has-text("Mengerti")').first
-        if await popup_btn.is_visible():
-            await popup_btn.click()
-            await asyncio.sleep(0.2)
-    except Exception:
-        pass
-
-
-async def try_download_image(page, rel_path: str, update_status) -> object:
-    """Upload gambar ke Google Translate dan download hasilnya. Return download object atau None."""
-    dl_selector = (
-        'button:has-text("Download translation"), '
-        'button:has-text("Download"), '
-        'button[aria-label*="Download translation"], '
-        'button[aria-label*="Unduh terjemahan"], '
-        'button[aria-label*="Download"]'
-    )
+async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
+    """Upload gambar ke Google Translate dan trigger download instan via DOM evaluation."""
+    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images", wait_until="domcontentloaded")
     
-    download_btn = page.locator(dl_selector).first
-    try:
-        # Tunggu tombol download muncul
-        await download_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
-        update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
-    except TimeoutError:
-        return None   # Timeout: me-refresh halaman dan coba lagi
+    file_input = page.locator('input[type="file"][accept*="image"]').first
+    if await file_input.count() == 0:
+        file_input = page.locator('input[type="file"]').last
 
-    try:
-        async with page.expect_download(timeout=20000) as dl_info:
-            await download_btn.click()
-        return await dl_info.value
-    except TimeoutError:
-        # Coba klik ulang tombol jika timeout download
-        try:
-            if await download_btn.is_visible():
-                async with page.expect_download(timeout=10000) as dl_info:
-                    await download_btn.click()
+    await file_input.wait_for(state="attached", timeout=10000)
+    await file_input.set_input_files(abs_path)
+    update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
+
+    # Tombol Download Translation Google Translate (jsname="hRZeKc")
+    dl_btn = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation"], button[aria-label*="Unduh terjemahan"]').first
+
+    # Poll tombol download dan trigger click langsung begitu siap
+    for s in range(1, TRANSLATE_TIMEOUT + 1):
+        if abort_flag.is_set():
+            break
+        await asyncio.sleep(0.5)
+        
+        count = await dl_btn.count()
+        if count > 0:
+            update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
+            try:
+                async with page.expect_download(timeout=8000) as dl_info:
+                    await dl_btn.evaluate("b => b.click()")
                 return await dl_info.value
-        except Exception:
-            pass
+            except Exception:
+                # Jika belum siap pada milidetik tersebut, lanjut loop
+                pass
+
     return None
+
+
+async def process_doc_file(page, abs_path: str, rel_path: str, update_status) -> object:
+    """Upload dokumen ke Google Translate dan download hasilnya."""
+    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=docs", wait_until="domcontentloaded")
+    
+    file_input = page.locator('input[type="file"][accept*="pdf"]').first
+    if await file_input.count() == 0:
+        file_input = page.locator('input[type="file"]').first
+
+    await file_input.wait_for(state="attached", timeout=10000)
+    await file_input.set_input_files(abs_path)
+    update_status(f"[blue]Menerjemahkan dokumen:[/blue] {os.path.basename(rel_path)}")
+
+    dl_btn = page.locator('button:has-text("Download translation"), button:has-text("Download"), button[aria-label*="Download"]').first
+    try:
+        await dl_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
+        update_status(f"[cyan]Mengunduh dokumen:[/cyan] {os.path.basename(rel_path)}")
+        async with page.expect_download(timeout=15000) as dl:
+            await dl_btn.click()
+        return await dl.value
+    except Exception:
+        return None
 
 
 async def process_file(context, file_path: str, progress: Progress, task_id,
                        lock: asyncio.Lock, failed_files: list, success_files: list) -> bool:
     """
-    Proses satu file menggunakan tab baru yang bersih (clean page lifecycle).
+    Proses satu file menggunakan tab bersih per file.
     """
     filename = os.path.basename(file_path)
     rel_path = os.path.relpath(file_path, DIR_MENTAH)
@@ -138,59 +151,15 @@ async def process_file(context, file_path: str, progress: Progress, task_id,
 
             if attempt > 1:
                 update_status(f"[magenta]Coba lagi ({attempt}/{MAX_RETRIES}):[/magenta] {filename}")
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
 
             page = None
             try:
                 page = await context.new_page()
-                
                 if is_image:
-                    # ==== MODE GAMBAR ====
-                    await page.goto(
-                        "https://translate.google.com/?sl=auto&tl=en&op=images&hl=en",
-                        wait_until="domcontentloaded",
-                        timeout=30000
-                    )
-                    await dismiss_popups(page)
-
-                    # Target spesifik input file gambar
-                    file_input = page.locator('input[type="file"][accept*="image"]').first
-                    if await file_input.count() == 0:
-                        file_input = page.locator('input[type="file"]').last
-
-                    await file_input.wait_for(state="attached", timeout=10000)
-                    await file_input.set_input_files(abs_path)
-                    
-                    update_status(f"[blue]Menerjemahkan:[/blue] {filename} (Percobaan {attempt})")
-                    downloaded = await try_download_image(page, rel_path, update_status)
-
+                    downloaded = await process_image_file(page, abs_path, rel_path, update_status)
                 else:
-                    # ==== MODE DOKUMEN ====
-                    await page.goto(
-                        "https://translate.google.com/?sl=auto&tl=en&op=docs&hl=en",
-                        wait_until="domcontentloaded",
-                        timeout=30000
-                    )
-                    await dismiss_popups(page)
-
-                    file_input = page.locator('input[type="file"][accept*="pdf"]').first
-                    if await file_input.count() == 0:
-                        file_input = page.locator('input[type="file"]').first
-
-                    await file_input.wait_for(state="attached", timeout=10000)
-                    await file_input.set_input_files(abs_path)
-                    
-                    update_status(f"[blue]Menerjemahkan dokumen:[/blue] {filename} (Percobaan {attempt})")
-
-                    download_btn = page.locator('button:has-text("Download translation"), button:has-text("Download"), button[aria-label*="Download"]').first
-                    try:
-                        await download_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
-                        async with page.expect_download(timeout=20000) as dl:
-                            await download_btn.click()
-                        downloaded = await dl.value
-                    except Exception:
-                        downloaded = None
-
+                    downloaded = await process_doc_file(page, abs_path, rel_path, update_status)
             except Exception:
                 downloaded = None
             finally:
@@ -252,7 +221,6 @@ async def run_batch(context, files_to_process: list, failed_files: list, success
     sem  = asyncio.Semaphore(tabs)
     lock = asyncio.Lock()
 
-    # Progress bar interaktif & bersih
     with Progress(
         SpinnerColumn("dots", style="bold cyan"),
         TextColumn("[bold green]{task.description}"),
@@ -291,7 +259,7 @@ async def run_batch(context, files_to_process: list, failed_files: list, success
                 break
 
             if tasks:
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
 
 
 async def amain():
@@ -299,10 +267,10 @@ async def amain():
     Path(DIR_HASIL).mkdir(exist_ok=True)
     Path(DIR_SELESAI).mkdir(exist_ok=True)
 
-    # Tampilkan banner header
+    mode_label = "Headless (Background)" if HEADLESS else "Windowed"
     console.print(Panel.fit(
         "[bold cyan]GOOGLE TRANSLATE AUTOMATOR[/bold cyan]\n"
-        "[dim]Mode Headless (Background) • Paralel Tab • Clean Progress CLI[/dim]",
+        f"[dim]Mode {mode_label} • Ultra-Fast DOM Execution • Clean CLI[/dim]",
         border_style="cyan"
     ))
 
@@ -324,8 +292,6 @@ async def amain():
     os.system('wmic process where "name=\'msedge.exe\' and commandline like \'%edge_profile%\'" call terminate >nul 2>&1')
     await asyncio.sleep(1)
 
-    USER_DATA_DIR = os.path.join(os.getcwd(), "edge_profile")
-
     # Listener tombol Q di thread terpisah
     abort_thread = threading.Thread(target=_listen_abort, daemon=True)
     abort_thread.start()
@@ -334,16 +300,20 @@ async def amain():
     failed_files  = []
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=USER_DATA_DIR,
+        browser = await p.chromium.launch(
             channel="msedge",
             headless=HEADLESS,
-            accept_downloads=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080",
                 "--no-first-run",
                 "--no-default-browser-check"
             ]
+        )
+        context = await browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
         )
 
         # ── Jalankan Batch Utama ──────────────────────────────────────────────
@@ -387,7 +357,7 @@ async def amain():
                 console.print(f"\n[bold green]Memulai ulang {len(retry_list)} file...[/bold green]\n")
                 await run_batch(context, retry_list, failed_files, success_files, title="Retrying")
 
-        await context.close()
+        await browser.close()
 
     # ── Ringkasan Akhir ───────────────────────────────────────────────────────
     console.print("\n")
