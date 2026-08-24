@@ -8,18 +8,37 @@ import msvcrt
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError
 
-from rich.console import Console
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    BarColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn
-)
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+import sys
+import subprocess
+
+try:
+    from rich.console import Console
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn
+    )
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+except ImportError:
+    print("Menginstall modul pendukung 'rich'...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich"])
+    from rich.console import Console
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn
+    )
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
 
 # ── Konfigurasi ───────────────────────────────────────────────────────────────
 DIR_MENTAH   = "mentah"
