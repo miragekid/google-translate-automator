@@ -11,6 +11,13 @@ from playwright.async_api import async_playwright, TimeoutError
 import sys
 import subprocess
 
+# Set utf-8 output encoding for terminal on Windows
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 try:
     from rich.console import Console
     from rich.progress import (
@@ -44,10 +51,13 @@ except ImportError:
 DIR_MENTAH   = "mentah"
 DIR_HASIL    = "hasil"
 DIR_SELESAI  = "mentah/selesai"
-NUM_TABS     = 5           # Jumlah tab paralel (sangat cepat ~2 detik per file)
+NUM_TABS     = 5           # Jumlah tab paralel
 MAX_RETRIES  = 3           # Maksimal percobaan per file
-TRANSLATE_TIMEOUT = 25     # Timeout tunggu terjemahan dalam detik
-HEADLESS     = True        # True = browser berjalan di background (hanya CLI yang tampil)
+TRANSLATE_TIMEOUT = 30     # Timeout tunggu terjemahan dalam detik
+HEADLESS     = True        # True = browser di background (hanya CLI yang tampil)
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+DOC_EXTENSIONS   = {'.pdf', '.docx', '.pptx', '.xlsx'}
 
 console = Console()
 
@@ -67,7 +77,7 @@ def _listen_abort():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
-    """Upload gambar ke Google Translate dan trigger download instan via DOM evaluation."""
+    """Upload gambar ke Google Translate, verifikasi OCR selesai 100%, lalu download hasilnya."""
     await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images", wait_until="domcontentloaded")
     
     file_input = page.locator('input[type="file"][accept*="image"]').first
@@ -78,25 +88,35 @@ async def process_image_file(page, abs_path: str, rel_path: str, update_status) 
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
 
-    # Tombol Download Translation Google Translate (jsname="hRZeKc")
-    dl_btn = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation"], button[aria-label*="Unduh terjemahan"]').first
+    # Tunggu sebentar agar proses OCR Google Translate aktif
+    await asyncio.sleep(1.0)
 
-    # Poll tombol download dan trigger click langsung begitu siap
-    for s in range(1, TRANSLATE_TIMEOUT + 1):
+    dl_btn    = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation"]').first
+    show_orig = page.locator('button[jsname="KN1ewe"], button:has-text("Show original"), [aria-label*="original"], [aria-label*="Original"]').first
+    copy_btn  = page.locator('button[jsname="kImuFf"], button:has-text("Copy text")').first
+
+    # Poll status terjemahan hingga selesai
+    for s in range(1, int(TRANSLATE_TIMEOUT * 2)):
         if abort_flag.is_set():
             break
-        await asyncio.sleep(0.5)
-        
-        count = await dl_btn.count()
-        if count > 0:
+
+        body = await page.locator('body').inner_text()
+        is_translating = "Translating" in body or "Menerjemahkan" in body
+        has_orig = await show_orig.is_visible()
+        has_copy = await copy_btn.is_visible()
+        has_dl   = await dl_btn.count() > 0
+
+        # Verifikasi: OCR selesai dan tombol aksi terjemahan aktif
+        if not is_translating and (has_orig or has_copy or has_dl):
             update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
             try:
-                async with page.expect_download(timeout=8000) as dl_info:
+                async with page.expect_download(timeout=10000) as dl_info:
                     await dl_btn.evaluate("b => b.click()")
                 return await dl_info.value
             except Exception:
-                # Jika belum siap pada milidetik tersebut, lanjut loop
                 pass
+
+        await asyncio.sleep(0.5)
 
     return None
 
@@ -127,17 +147,31 @@ async def process_doc_file(page, abs_path: str, rel_path: str, update_status) ->
 async def process_file(context, file_path: str, progress: Progress, task_id,
                        lock: asyncio.Lock, failed_files: list, success_files: list) -> bool:
     """
-    Proses satu file menggunakan tab bersih per file.
+    Proses satu file (gambar/dokumen/metadata) menggunakan tab bersih per file.
     """
     filename = os.path.basename(file_path)
     rel_path = os.path.relpath(file_path, DIR_MENTAH)
     rel_dir  = os.path.dirname(rel_path)
     ext      = Path(filename).suffix.lower()
-    is_image = ext in ['.jpg', '.jpeg', '.png', '.webp']
     abs_path = os.path.abspath(file_path)
 
     def update_status(text: str):
         progress.update(task_id, status_file=text)
+
+    # ── Handle file non-media (seperti ComicInfo.xml, metadata, txt) ────────────
+    if ext not in IMAGE_EXTENSIONS and ext not in DOC_EXTENSIONS:
+        target_hasil_dir   = os.path.join(DIR_HASIL, rel_dir)
+        target_selesai_dir = os.path.join(DIR_SELESAI, rel_dir)
+        Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
+        Path(target_selesai_dir).mkdir(parents=True, exist_ok=True)
+
+        shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
+        shutil.move(file_path, os.path.join(target_selesai_dir, filename))
+
+        async with lock:
+            success_files.append(rel_path)
+            progress.advance(task_id, 1)
+        return True
 
     update_status(f"[yellow]Memproses:[/yellow] {filename}")
 
@@ -156,7 +190,7 @@ async def process_file(context, file_path: str, progress: Progress, task_id,
             page = None
             try:
                 page = await context.new_page()
-                if is_image:
+                if ext in IMAGE_EXTENSIONS:
                     downloaded = await process_image_file(page, abs_path, rel_path, update_status)
                 else:
                     downloaded = await process_doc_file(page, abs_path, rel_path, update_status)
@@ -270,7 +304,7 @@ async def amain():
     mode_label = "Headless (Background)" if HEADLESS else "Windowed"
     console.print(Panel.fit(
         "[bold cyan]GOOGLE TRANSLATE AUTOMATOR[/bold cyan]\n"
-        f"[dim]Mode {mode_label} • Ultra-Fast DOM Execution • Clean CLI[/dim]",
+        f"[dim]Mode {mode_label} • Verified OCR Translation • Clean CLI[/dim]",
         border_style="cyan"
     ))
 
@@ -363,7 +397,7 @@ async def amain():
     console.print("\n")
     if not failed_files and not abort_flag.is_set():
         summary_text = (
-            f"[bold green]Semua {len(success_files)} file berhasil ditranslate![/bold green]\n"
+            f"[bold green]Semua {len(success_files)} file berhasil diproses & ditranslate![/bold green]\n"
             f"[dim]Hasil tersimpan di folder '{DIR_HASIL}'[/dim]"
         )
         console.print(Panel(summary_text, title="Status Akhir", border_style="green"))
