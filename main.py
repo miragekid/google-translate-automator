@@ -78,52 +78,39 @@ def _listen_abort():
 
 async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
     """Upload gambar ke Google Translate, verifikasi OCR selesai 100%, lalu download hasilnya."""
-    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images", wait_until="domcontentloaded")
+    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images&hl=en", wait_until="domcontentloaded")
     
     file_input = page.locator('input[type="file"][accept*="image"]').first
     if await file_input.count() == 0:
-        file_input = page.locator('input[type="file"]').last
+        file_input = page.locator('input[type="file"]').first
 
     await file_input.wait_for(state="attached", timeout=10000)
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
 
-    # Tunggu sebentar agar proses OCR Google Translate aktif
-    await asyncio.sleep(1.0)
+    dl_btn = page.locator('button[jsname="hRZeKc"]:visible, button:has-text("Download translation"):visible, button[aria-label*="Download translation" i]:visible, button[aria-label*="Unduh terjemahan" i]:visible').first
 
-    dl_btn    = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation"]').first
-    show_orig = page.locator('button[jsname="KN1ewe"], button:has-text("Show original"), [aria-label*="original"], [aria-label*="Original"]').first
-    copy_btn  = page.locator('button[jsname="kImuFf"], button:has-text("Copy text")').first
-
-    # Poll status terjemahan hingga selesai
-    for s in range(1, int(TRANSLATE_TIMEOUT * 2)):
-        if abort_flag.is_set():
-            break
-
-        body = await page.locator('body').inner_text()
-        is_translating = "Translating" in body or "Menerjemahkan" in body
-        has_orig = await show_orig.is_visible()
-        has_copy = await copy_btn.is_visible()
-        has_dl   = await dl_btn.count() > 0
-
-        # Verifikasi: OCR selesai dan tombol aksi terjemahan aktif
-        if not is_translating and (has_orig or has_copy or has_dl):
-            update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
-            try:
-                async with page.expect_download(timeout=10000) as dl_info:
+    try:
+        await dl_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
+        update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
+        async with page.expect_download(timeout=10000) as dl_info:
+            await dl_btn.click()
+        return await dl_info.value
+    except Exception:
+        # Fallback click jika terhalang overlay
+        try:
+            if await dl_btn.is_visible():
+                async with page.expect_download(timeout=5000) as dl_info:
                     await dl_btn.evaluate("b => b.click()")
                 return await dl_info.value
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.5)
-
-    return None
+        except Exception:
+            pass
+        return None
 
 
 async def process_doc_file(page, abs_path: str, rel_path: str, update_status) -> object:
     """Upload dokumen ke Google Translate dan download hasilnya."""
-    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=docs", wait_until="domcontentloaded")
+    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=docs&hl=en", wait_until="domcontentloaded")
     
     file_input = page.locator('input[type="file"][accept*="pdf"]').first
     if await file_input.count() == 0:
@@ -133,7 +120,7 @@ async def process_doc_file(page, abs_path: str, rel_path: str, update_status) ->
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan dokumen:[/blue] {os.path.basename(rel_path)}")
 
-    dl_btn = page.locator('button:has-text("Download translation"), button:has-text("Download"), button[aria-label*="Download"]').first
+    dl_btn = page.locator('button[jsname="hRZeKc"]:visible, button:has-text("Download translation"):visible, button:has-text("Download"):visible, button[aria-label*="Download" i]:visible, button[aria-label*="Unduh" i]:visible').first
     try:
         await dl_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
         update_status(f"[cyan]Mengunduh dokumen:[/cyan] {os.path.basename(rel_path)}")
