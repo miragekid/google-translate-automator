@@ -82,30 +82,36 @@ async def process_image_file(page, abs_path: str, rel_path: str, update_status) 
     
     file_input = page.locator('input[type="file"][accept*="image"]').first
     if await file_input.count() == 0:
-        file_input = page.locator('input[type="file"]').first
+        file_input = page.locator('input[type="file"]').last
 
     await file_input.wait_for(state="attached", timeout=10000)
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
 
-    dl_btn = page.locator('button[jsname="hRZeKc"]:visible, button:has-text("Download translation"):visible, button[aria-label*="Download translation" i]:visible, button[aria-label*="Unduh terjemahan" i]:visible').first
+    dl_btn = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation" i], button[aria-label*="Unduh terjemahan" i]').first
 
-    try:
-        await dl_btn.wait_for(state="visible", timeout=TRANSLATE_TIMEOUT * 1000)
-        update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
-        async with page.expect_download(timeout=10000) as dl_info:
-            await dl_btn.click()
-        return await dl_info.value
-    except Exception:
-        # Fallback click jika terhalang overlay
-        try:
-            if await dl_btn.is_visible():
-                async with page.expect_download(timeout=5000) as dl_info:
+    # Beri waktu minimum untuk Google Translate memproses OCR gambar
+    await asyncio.sleep(3.0)
+
+    for s in range(1, int(TRANSLATE_TIMEOUT * 2)):
+        if abort_flag.is_set():
+            break
+
+        body = await page.locator('body').inner_text()
+        is_translating = "Translating" in body or "Menerjemahkan" in body
+
+        if not is_translating and await dl_btn.count() > 0:
+            update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
+            try:
+                async with page.expect_download(timeout=10000) as dl_info:
                     await dl_btn.evaluate("b => b.click()")
                 return await dl_info.value
-        except Exception:
-            pass
-        return None
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.5)
+
+    return None
 
 
 async def process_doc_file(page, abs_path: str, rel_path: str, update_status) -> object:
