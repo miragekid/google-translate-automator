@@ -77,7 +77,15 @@ def _listen_abort():
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
-    """Upload gambar ke Google Translate, verifikasi OCR selesai 100%, lalu download hasilnya."""
+    """Upload gambar ke Google Translate, tunggu respon OCR backend dan render canvas, lalu download."""
+    ocr_done_event = asyncio.Event()
+
+    def on_response(r):
+        if "batchexecute" in r.url and r.status == 200:
+            ocr_done_event.set()
+
+    page.on("response", on_response)
+
     await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images&hl=en", wait_until="domcontentloaded")
     
     file_input = page.locator('input[type="file"][accept*="image"]').first
@@ -88,12 +96,19 @@ async def process_image_file(page, abs_path: str, rel_path: str, update_status) 
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
 
+    # Tunggu respon data OCR dari backend Google
+    try:
+        await asyncio.wait_for(ocr_done_event.wait(), timeout=12.0)
+    except asyncio.TimeoutError:
+        pass
+
+    # Jeda rendering canvas/teks terjemahan agar teks terpasang sempurna pada gambar
+    await asyncio.sleep(2.5)
+
     dl_btn = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation" i], button[aria-label*="Unduh terjemahan" i]').first
 
-    # Beri waktu minimum untuk Google Translate memproses OCR gambar
-    await asyncio.sleep(3.0)
-
-    for s in range(1, int(TRANSLATE_TIMEOUT * 2)):
+    # Poll status terjemahan & trigger unduh
+    for s in range(1, int(TRANSLATE_TIMEOUT)):
         if abort_flag.is_set():
             break
 
