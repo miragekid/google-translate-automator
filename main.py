@@ -154,13 +154,13 @@ async def process_doc_file(page, abs_path: str, rel_path: str, update_status) ->
         return None
 
 
-async def process_file(context, file_path: str, progress: Progress, task_id,
+async def process_file(context, file_path: str, source_dir: str, progress: Progress, task_id,
                        lock: asyncio.Lock, failed_files: list, success_files: list) -> bool:
     """
     Proses satu file (gambar/dokumen/metadata) menggunakan tab bersih per file.
     """
     filename = os.path.basename(file_path)
-    rel_path = os.path.relpath(file_path, DIR_MENTAH)
+    rel_path = os.path.relpath(file_path, source_dir)
     rel_dir  = os.path.dirname(rel_path)
     ext      = Path(filename).suffix.lower()
     abs_path = os.path.abspath(file_path)
@@ -170,13 +170,14 @@ async def process_file(context, file_path: str, progress: Progress, task_id,
 
     # ── Handle file non-media (seperti ComicInfo.xml, metadata, txt) ────────────
     if ext not in IMAGE_EXTENSIONS and ext not in DOC_EXTENSIONS:
-        target_hasil_dir   = os.path.join(DIR_HASIL, rel_dir)
-        target_selesai_dir = os.path.join(DIR_SELESAI, rel_dir)
-        Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
-        Path(target_selesai_dir).mkdir(parents=True, exist_ok=True)
+        if source_dir == DIR_MENTAH:
+            target_hasil_dir   = os.path.join(DIR_HASIL, rel_dir)
+            target_selesai_dir = os.path.join(DIR_SELESAI, rel_dir)
+            Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
+            Path(target_selesai_dir).mkdir(parents=True, exist_ok=True)
 
-        shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
-        shutil.move(file_path, os.path.join(target_selesai_dir, filename))
+            shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
+            shutil.move(file_path, os.path.join(target_selesai_dir, filename))
 
         async with lock:
             success_files.append(rel_path)
@@ -218,24 +219,25 @@ async def process_file(context, file_path: str, progress: Progress, task_id,
 
         # ── Simpan hasil jika download berhasil ────────────────────────────────
         if downloaded:
-            target_hasil_dir   = os.path.join(DIR_HASIL, rel_dir)
-            target_selesai_dir = os.path.join(DIR_SELESAI, rel_dir)
+            target_hasil_dir = os.path.join(DIR_HASIL, rel_dir)
             Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
-            Path(target_selesai_dir).mkdir(parents=True, exist_ok=True)
 
             safe_filename   = downloaded.suggested_filename
             final_save_path = os.path.join(target_hasil_dir, safe_filename)
             await downloaded.save_as(final_save_path)
 
-            shutil.move(file_path, os.path.join(target_selesai_dir, filename))
+            # Jika sumber dari 'mentah', pindahkan ke 'selesai' dan bersihkan folder kosong
+            if source_dir == DIR_MENTAH:
+                target_selesai_dir = os.path.join(DIR_SELESAI, rel_dir)
+                Path(target_selesai_dir).mkdir(parents=True, exist_ok=True)
+                shutil.move(file_path, os.path.join(target_selesai_dir, filename))
 
-            # Hapus folder asal jika kosong (kecuali root mentah)
-            orig_dir = os.path.dirname(file_path)
-            if orig_dir != DIR_MENTAH:
-                try:
-                    os.rmdir(orig_dir)
-                except OSError:
-                    pass
+                orig_dir = os.path.dirname(file_path)
+                if orig_dir != DIR_MENTAH:
+                    try:
+                        os.rmdir(orig_dir)
+                    except OSError:
+                        pass
 
             success = True
             async with lock:
@@ -257,7 +259,7 @@ async def process_file(context, file_path: str, progress: Progress, task_id,
     return success
 
 
-async def run_batch(context, files_to_process: list, failed_files: list, success_files: list, title: str = "Translating"):
+async def run_batch(context, files_to_process: list, source_dir: str, failed_files: list, success_files: list, title: str = "Translating"):
     """Jalankan batch file secara paralel dengan Loading Bar yang bersih dan rapi."""
     total = len(files_to_process)
     tabs  = min(NUM_TABS, total)
@@ -288,7 +290,7 @@ async def run_batch(context, files_to_process: list, failed_files: list, success
             if abort_flag.is_set():
                 return
             async with sem:
-                await process_file(context, file_path, progress, task_id, lock, failed_files, success_files)
+                await process_file(context, file_path, source_dir, progress, task_id, lock, failed_files, success_files)
 
         tasks = [asyncio.create_task(worker(fp)) for fp in files_to_process]
 
@@ -314,23 +316,82 @@ async def amain():
     mode_label = "Headless (Background)" if HEADLESS else "Windowed"
     console.print(Panel.fit(
         "[bold cyan]GOOGLE TRANSLATE AUTOMATOR[/bold cyan]\n"
-        f"[dim]Mode {mode_label} • Verified OCR Translation • Clean CLI[/dim]",
+        f"[dim]Mode {mode_label} • Verified OCR Engine • Re-translate Support[/dim]",
         border_style="cyan"
     ))
 
-    # Kumpulkan semua file (kecuali folder selesai)
-    files_to_process = [
+    # Cek file di folder mentah dan folder hasil
+    mentah_files = [
         str(fp) for fp in Path(DIR_MENTAH).rglob('*')
         if fp.is_file() and 'selesai' not in fp.parts
     ]
+    hasil_files = [
+        str(fp) for fp in Path(DIR_HASIL).rglob('*')
+        if fp.is_file() and fp.suffix.lower() in IMAGE_EXTENSIONS.union(DOC_EXTENSIONS)
+    ]
 
-    if not files_to_process:
-        console.print(f"[yellow]Tidak ada file di folder '{DIR_MENTAH}' untuk diproses.[/yellow]")
+    source_dir = DIR_MENTAH
+    files_to_process = []
+
+    if mentah_files and hasil_files:
+        console.print(Panel(
+            f"[bold green][1][/bold green] : Translate folder '[bold]mentah[/bold]' ({len(mentah_files)} file)\n"
+            f"[bold yellow][2][/bold yellow] : Re-translate folder '[bold]hasil[/bold]' ({len(hasil_files)} file)",
+            title="Pilih Folder Sumber",
+            border_style="cyan"
+        ))
+        choice = None
+        while choice is None:
+            if msvcrt.kbhit():
+                key = msvcrt.getch().lower()
+                if key == b'1':
+                    choice = '1'
+                elif key == b'2':
+                    choice = '2'
+            await asyncio.sleep(0.1)
+
+        if choice == '1':
+            source_dir = DIR_MENTAH
+            files_to_process = mentah_files
+        else:
+            source_dir = DIR_HASIL
+            files_to_process = hasil_files
+
+    elif mentah_files:
+        source_dir = DIR_MENTAH
+        files_to_process = mentah_files
+
+    elif hasil_files:
+        console.print(f"[yellow]Folder '{DIR_MENTAH}' kosong, ditemukan {len(hasil_files)} file di folder '{DIR_HASIL}'.[/yellow]")
+        console.print(Panel(
+            f"[bold yellow][Y][/bold yellow] : Mulai Re-translate semua file di folder '[bold]hasil[/bold]'\n"
+            f"[bold red][N][/bold red] : Keluar",
+            title="Re-translate Folder Hasil?",
+            border_style="yellow"
+        ))
+        choice = None
+        while choice is None:
+            if msvcrt.kbhit():
+                key = msvcrt.getch().lower()
+                if key == b'y':
+                    choice = 'y'
+                elif key == b'n':
+                    choice = 'n'
+            await asyncio.sleep(0.1)
+
+        if choice == 'y':
+            source_dir = DIR_HASIL
+            files_to_process = hasil_files
+        else:
+            console.print("[dim]Program selesai.[/dim]")
+            return
+    else:
+        console.print(f"[yellow]Tidak ada file di folder '{DIR_MENTAH}' maupun '{DIR_HASIL}'.[/yellow]")
         return
 
     total = len(files_to_process)
     tabs = min(NUM_TABS, total)
-    console.print(f"[bold]Total file:[/bold] {total} file  |  [bold]Tab paralel:[/bold] {tabs} tab  |  [bold red]Batal:[/bold red] Tekan [bold]Q[/bold] kapan saja\n")
+    console.print(f"\n[bold]Memproses dari:[/bold] '{source_dir}'  |  [bold]Total file:[/bold] {total} file  |  [bold]Tab paralel:[/bold] {tabs} tab  |  [bold red]Batal:[/bold red] Tekan [bold]Q[/bold]\n")
 
     # Bersihkan Edge background process
     os.system('wmic process where "name=\'msedge.exe\' and commandline like \'%edge_profile%\'" call terminate >nul 2>&1')
@@ -361,7 +422,8 @@ async def amain():
         )
 
         # ── Jalankan Batch Utama ──────────────────────────────────────────────
-        await run_batch(context, files_to_process, failed_files, success_files, title="Translating")
+        batch_title = "Re-translating" if source_dir == DIR_HASIL else "Translating"
+        await run_batch(context, files_to_process, source_dir, failed_files, success_files, title=batch_title)
 
         # ── Loop Retry Jika Ada File Gagal ────────────────────────────────────
         while failed_files and not abort_flag.is_set():
@@ -371,7 +433,7 @@ async def amain():
             table.add_column("File / Path", style="white")
 
             for idx, f in enumerate(failed_files, 1):
-                table.add_row(str(idx), os.path.relpath(f, DIR_MENTAH))
+                table.add_row(str(idx), os.path.relpath(f, source_dir))
 
             console.print(table)
             console.print(Panel(
@@ -399,7 +461,7 @@ async def amain():
                 retry_list = failed_files[:]
                 failed_files.clear()
                 console.print(f"\n[bold green]Memulai ulang {len(retry_list)} file...[/bold green]\n")
-                await run_batch(context, retry_list, failed_files, success_files, title="Retrying")
+                await run_batch(context, retry_list, source_dir, failed_files, success_files, title="Retrying")
 
         await browser.close()
 
@@ -418,24 +480,25 @@ async def amain():
         )
         console.print(Panel(summary_text, title="Status Akhir", border_style="yellow"))
 
-    # ── Bersihkan ISI Folder Mentah (folder mentah tetap ada) ─────────────────
-    remaining = [
-        p for p in Path(DIR_MENTAH).rglob('*')
-        if p.is_file() and 'selesai' not in p.parts
-    ]
-    if not remaining and not abort_flag.is_set():
-        for item in Path(DIR_MENTAH).iterdir():
-            try:
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
-            except Exception as e:
-                console.print(f"[red]Gagal menghapus {item}: {e}[/red]")
-        console.print("[green]Isi folder 'mentah' telah dibersihkan. Folder 'mentah' tetap ada.[/green]\n")
-    else:
-        if remaining:
-            console.print(f"[yellow]{len(remaining)} file masih tersisa di folder 'mentah' (tidak dihapus).[/yellow]\n")
+    # ── Bersihkan ISI Folder Mentah (HANYA jika sumber dari mentah) ───────────
+    if source_dir == DIR_MENTAH:
+        remaining = [
+            p for p in Path(DIR_MENTAH).rglob('*')
+            if p.is_file() and 'selesai' not in p.parts
+        ]
+        if not remaining and not abort_flag.is_set():
+            for item in Path(DIR_MENTAH).iterdir():
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                except Exception as e:
+                    console.print(f"[red]Gagal menghapus {item}: {e}[/red]")
+            console.print("[green]Isi folder 'mentah' telah dibersihkan. Folder 'mentah' tetap ada.[/green]\n")
+        else:
+            if remaining:
+                console.print(f"[yellow]{len(remaining)} file masih tersisa di folder 'mentah' (tidak dihapus).[/yellow]\n")
 
 
 def main():
