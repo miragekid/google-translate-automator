@@ -78,6 +78,15 @@ def _listen_abort():
 
 async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
     """Upload gambar ke Google Translate, tunggu respon OCR backend dan render canvas, lalu download."""
+    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images&hl=en", wait_until="domcontentloaded")
+    
+    file_input = page.locator('input[type="file"][accept*="image"]').first
+    if await file_input.count() == 0:
+        file_input = page.locator('input[type="file"]').last
+
+    await file_input.wait_for(state="attached", timeout=10000)
+
+    # Daftarkan listener OCR HANYA setelah halaman selesai dimuat dan tepat sebelum upload
     ocr_done_event = asyncio.Event()
 
     def on_response(r):
@@ -86,24 +95,17 @@ async def process_image_file(page, abs_path: str, rel_path: str, update_status) 
 
     page.on("response", on_response)
 
-    await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images&hl=en", wait_until="domcontentloaded")
-    
-    file_input = page.locator('input[type="file"][accept*="image"]').first
-    if await file_input.count() == 0:
-        file_input = page.locator('input[type="file"]').last
-
-    await file_input.wait_for(state="attached", timeout=10000)
     await file_input.set_input_files(abs_path)
     update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
 
-    # Tunggu respon data OCR dari backend Google
+    # Tunggu respon data OCR dari backend Google (khusus untuk file gambar ini)
     try:
-        await asyncio.wait_for(ocr_done_event.wait(), timeout=12.0)
+        await asyncio.wait_for(ocr_done_event.wait(), timeout=15.0)
     except asyncio.TimeoutError:
         pass
 
     # Jeda rendering canvas/teks terjemahan agar teks terpasang sempurna pada gambar
-    await asyncio.sleep(2.5)
+    await asyncio.sleep(3.5)
 
     dl_btn = page.locator('button[jsname="hRZeKc"], button:has-text("Download translation"), button[aria-label*="Download translation" i], button[aria-label*="Unduh terjemahan" i]').first
 
