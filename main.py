@@ -7,6 +7,8 @@ os.environ["NODE_OPTIONS"] = "--max-old-space-size=4096"
 import time
 import shutil
 import re
+import io
+import uuid
 import asyncio
 import threading
 import msvcrt
@@ -20,6 +22,14 @@ if sys.platform == 'win32':
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Menginstall modul pendukung 'Pillow'...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
+    from PIL import Image
+
 
 
 try:
@@ -61,6 +71,9 @@ TRANSLATE_TIMEOUT = 60     # Timeout tunggu terjemahan dalam detik (dinaikkan un
 HEADLESS     = True        # True = browser di background (hanya CLI yang tampil)
 TAB_DELAY    = 3.0         # Jeda waktu (detik) antar tab saat mulai agar tidak bersamaan
 
+# Batas ukuran gambar untuk upload Google Translate (10 MB limit)
+MAX_IMAGE_SIZE_BYTES = int(9.8 * 1024 * 1024)  # 9.8 MB untuk margin aman di bawah 10 MB
+TEMP_OPT_DIR         = ".temp_opt"             # Folder sementara untuk file yang dioptimasi
 
 # Toleransi ukuran file untuk mendeteksi hasil "palsu" (Google Translate return file asli)
 # Jika ukuran file hasil >= X% ukuran asli, dianggap belum diterjemahkan
@@ -70,6 +83,7 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
 DOC_EXTENSIONS   = {'.pdf', '.docx', '.pptx', '.xlsx'}
 
 console = Console()
+
 
 # ── Abort flag ────────────────────────────────────────────────────────────────
 abort_flag = threading.Event()
@@ -110,6 +124,80 @@ def _is_fake_translation(src_path: Path, hasil_path: Path) -> bool:
         return False
     ratio = hasil_size / src_size
     return ratio >= FAKE_TRANSLATE_RATIO
+
+
+def optimize_image_if_needed(abs_path: str, update_status) -> tuple:
+    """
+    Jika file gambar berukuran > MAX_IMAGE_SIZE_BYTES (10 MB):
+    1. Konversi ke format JPEG (mode RGB dengan background putih jika ada transparansi).
+    2. Jika masih >= 10 MB, resize dimensi atau turunkan kualitas secara bertahap hingga < 10 MB.
+    Menyimpan ke folder sementara (.temp_opt) dan mengembalikan (path_file_upload, is_temp).
+    """
+    if not os.path.exists(abs_path):
+        return abs_path, False
+
+    src_size = os.path.getsize(abs_path)
+    if src_size <= MAX_IMAGE_SIZE_BYTES:
+        return abs_path, False
+
+    filename = os.path.basename(abs_path)
+    stem = Path(filename).stem
+    update_status(f"[yellow]Mengoptimasi (>10MB -> JPG):[/yellow] {filename}")
+
+    # Buat subfolder unik per worker untuk mencegah konflik nama file yang sama
+    unique_dir = Path(TEMP_OPT_DIR) / uuid.uuid4().hex[:8]
+    unique_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = unique_dir / f"{stem}.jpg"
+
+    try:
+        with Image.open(abs_path) as img:
+            # Handle alpha channel (RGBA, LA, atau palette dengan transparansi)
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                img = img.convert('RGBA')
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                rgb_img = bg
+            elif img.mode != 'RGB':
+                rgb_img = img.convert('RGB')
+            else:
+                rgb_img = img
+
+            quality = 85
+            scale = 1.0
+            orig_w, orig_h = rgb_img.size
+
+            while True:
+                cur_w = max(1, int(orig_w * scale))
+                cur_h = max(1, int(orig_h * scale))
+
+                if scale < 1.0:
+                    resized = rgb_img.resize((cur_w, cur_h), Image.Resampling.LANCZOS)
+                else:
+                    resized = rgb_img
+
+                buf = io.BytesIO()
+                resized.save(buf, format='JPEG', quality=quality, optimize=True)
+                size = len(buf.getvalue())
+
+                if size < MAX_IMAGE_SIZE_BYTES or (quality <= 65 and scale <= 0.4):
+                    with open(temp_path, "wb") as f_out:
+                        f_out.write(buf.getvalue())
+                    break
+
+                if quality > 70:
+                    quality -= 5
+                else:
+                    scale *= 0.85
+
+        opt_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        orig_size_mb = src_size / (1024 * 1024)
+        update_status(f"[green]Optimasi sukses ({orig_size_mb:.1f}MB -> {opt_size_mb:.1f}MB):[/green] {filename}")
+        return str(temp_path.resolve()), True
+
+    except Exception as e:
+        console.print(f"[red]Gagal mengoptimasi gambar {filename}: {e}[/red]")
+        return abs_path, False
+
 
 
 def build_comparison_table() -> tuple:
@@ -232,100 +320,93 @@ def restore_fake_results(fake_list: list):
 
 async def process_image_file(page, abs_path: str, rel_path: str, update_status) -> object:
     """
-    Upload gambar ke Google Translate, tunggu respon OCR backend dan render canvas, lalu download.
-    Mendukung file besar (5-12MB+) dengan timeout yang lebih panjang dan validasi hasil.
+    Upload gambar ke Google Translate, pantau status render terjemahan secara akurat, lalu unduh hasilnya.
+    Menggunakan deteksi multi-kondisi (Show original + Visible Download button) untuk memastikan
+    tidak pernah mengunduh sebelum terjemahan selesai atau salah klik tombol tersembunyi.
     """
-    src_size = Path(abs_path).stat().st_size
+    filename = os.path.basename(rel_path)
 
     await page.goto("https://translate.google.com/?sl=auto&tl=en&op=images&hl=en", wait_until="domcontentloaded")
+
+    # Tutup popup guide / "Got it" / "Mengerti" jika muncul
+    got_it = page.locator('button:has-text("Got it"), button:has-text("Mengerti"), button[jsname="XTYNyb"]:visible').first
+    if await got_it.count() > 0:
+        try:
+            await got_it.click()
+        except Exception:
+            pass
 
     file_input = page.locator('input[type="file"][accept*="image"]').first
     if await file_input.count() == 0:
         file_input = page.locator('input[type="file"]').last
 
     await file_input.wait_for(state="attached", timeout=10000)
+    await file_input.set_input_files(abs_path)
+    update_status(f"[blue]Menerjemahkan:[/blue] {filename}")
 
-    # Daftarkan listener OCR sebelum upload
-    ocr_done_event = asyncio.Event()
+    # Jeda awal 2 detik agar Google Translate mulai memproses OCR dan memperbarui DOM
+    await asyncio.sleep(2.0)
 
-    def on_response(r):
-        if "batchexecute" in r.url and r.status == 200:
-            ocr_done_event.set()
+    # Selector khusus untuk tombol download dan tombol "Show original" yang VISIBLE
+    dl_btn_vis = page.locator('button[jsname="hRZeKc"]:visible, button:has-text("Download translation"):visible, button[aria-label*="Download translation" i]:visible, button[aria-label*="Unduh terjemahan" i]:visible').first
+    show_orig_btn = page.locator('button[aria-label*="Show original" i]:visible, button[jsname="KN1ewe"]:visible, button[aria-label*="Tampilkan yang asli" i]:visible').first
 
-    page.on("response", on_response)
+    deadline = time.monotonic() + TRANSLATE_TIMEOUT
+    stable_ready_count = 0
 
-    try:
-        await file_input.set_input_files(abs_path)
-        update_status(f"[blue]Menerjemahkan:[/blue] {os.path.basename(rel_path)}")
+    while time.monotonic() < deadline:
+        if abort_flag.is_set():
+            break
 
-        # Tunggu respon OCR — file besar butuh lebih lama
-        # Skala timeout berdasarkan ukuran file: min 20s, max 60s
-        ocr_timeout = max(20.0, min(60.0, src_size / (500 * 1024)))  # ~1s per 500KB
-        try:
-            await asyncio.wait_for(ocr_done_event.wait(), timeout=ocr_timeout)
-        except asyncio.TimeoutError:
-            pass
-
-        # Jeda rendering canvas
-        await asyncio.sleep(4.0)
-
-        dl_btn = page.locator(
-            'button[jsname="hRZeKc"], '
-            'button:has-text("Download translation"), '
-            'button[aria-label*="Download translation" i], '
-            'button[aria-label*="Unduh terjemahan" i]'
-        ).first
-
-        # Poll berbasis waktu nyata (bukan hitungan iterasi)
-        deadline = time.monotonic() + TRANSLATE_TIMEOUT
-        while time.monotonic() < deadline:
-            if abort_flag.is_set():
-                break
-
-            # Cek status terjemahan langsung di dalam DOM browser tanpa mentransfer string body besar via IPC
+        # Tutup popup jika muncul kembali di tengah proses
+        if await got_it.count() > 0 and await got_it.is_visible():
             try:
-                is_translating = await page.evaluate(
-                    "() => { const t = document.body ? (document.body.innerText || '') : ''; return t.includes('Translating') || t.includes('Menerjemahkan'); }"
-                )
+                await got_it.click()
             except Exception:
-                is_translating = False
+                pass
 
-            if not is_translating and await dl_btn.count() > 0:
-                update_status(f"[cyan]Mengunduh:[/cyan] {os.path.basename(rel_path)}")
+        # Periksa status halaman via in-page evaluate
+        state = await page.evaluate('''() => {
+            const text = document.body ? document.body.innerText : "";
+            const isTranslating = text.includes("Translating") || text.includes("Menerjemahkan");
+            const noText = text.includes("Can't detect text") || text.includes("tidak dapat mendeteksi");
+            return {isTranslating, noText};
+        }''')
+
+        # 1. Jika Google Translate mengonfirmasi tidak ada teks yang terdeteksi
+        # (misal halaman ilustrasi murni/credits), anggap selesai tanpa perlu dipaksa translate
+        if state["noText"]:
+            update_status(f"[cyan]Tidak ada teks:[/cyan] {filename}")
+            return "NO_TEXT"
+
+        has_show_orig = await show_orig_btn.count() > 0 and await show_orig_btn.is_visible()
+        has_dl_vis = await dl_btn_vis.count() > 0 and await dl_btn_vis.is_visible() and not await dl_btn_vis.is_disabled()
+
+        # 2. Kondisi terjemahan selesai & siap unduh:
+        # Jika tombol Show Original muncul dan tombol Download terlihat serta aktif
+        if has_dl_vis and not state["isTranslating"] and has_show_orig:
+            stable_ready_count += 1
+            # Butuh 2 siklus polling (~0.8s) stabil agar render canvas selesai sepenuhnya
+            if stable_ready_count >= 2:
+                update_status(f"[cyan]Mengunduh:[/cyan] {filename}")
                 try:
-                    async with page.expect_download(timeout=30000) as dl_info:
-                        await dl_btn.evaluate("b => b.click()")
+                    async with page.expect_download(timeout=15000) as dl_info:
+                        await dl_btn_vis.click()
                     dl = await dl_info.value
 
-                    # ── Validasi: pastikan hasil download BUKAN file asli yang sama ──
-                    # Simpan sementara ke temp path untuk cek ukurannya
+                    # Validasi: pastikan file bukan 0 byte
                     dl_path_str = await dl.path()
-                    if dl_path_str:
-                        tmp_path = Path(dl_path_str)
-                        if tmp_path.exists():
-                            dl_size = tmp_path.stat().st_size
-                            ratio   = dl_size / src_size if src_size > 0 else 0
-                            if ratio >= FAKE_TRANSLATE_RATIO:
-                                # Google return file asli = terjemahan tidak terjadi
-                                update_status(f"[red]Gagal (file asli):[/red] {os.path.basename(rel_path)}")
-                                try:
-                                    await dl.delete()
-                                except Exception:
-                                    pass
-                                return None
-
-                    return dl
+                    if dl_path_str and Path(dl_path_str).exists():
+                        if Path(dl_path_str).stat().st_size > 0:
+                            return dl
                 except Exception:
                     pass
+        else:
+            stable_ready_count = 0
 
-            await asyncio.sleep(0.8)
+        await asyncio.sleep(0.4)
 
-        return None
-    finally:
-        try:
-            page.remove_listener("response", on_response)
-        except Exception:
-            pass
+    return None
 
 
 async def process_doc_file(page, abs_path: str, rel_path: str, update_status) -> object:
@@ -385,15 +466,21 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
 
     downloaded = None
     success    = False
+    upload_path = abs_path
+    is_temp     = False
 
     try:
+        # Jika file gambar > 10MB, optimasi/convert ke JPEG sementara (<10MB) sebelum upload
+        if ext in IMAGE_EXTENSIONS:
+            upload_path, is_temp = optimize_image_if_needed(abs_path, update_status)
+
         for attempt in range(1, MAX_RETRIES + 1):
             if abort_flag.is_set():
                 break
 
             if attempt > 1:
                 update_status(f"[magenta]Coba lagi ({attempt}/{MAX_RETRIES}):[/magenta] {filename}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.5)
 
             context = None
             page = None
@@ -405,11 +492,19 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
                 )
                 page = await context.new_page()
                 if ext in IMAGE_EXTENSIONS:
-                    downloaded = await process_image_file(page, abs_path, rel_path, update_status)
+                    downloaded = await process_image_file(page, upload_path, rel_path, update_status)
                 else:
                     downloaded = await process_doc_file(page, abs_path, rel_path, update_status)
 
-                # Simpan hasil langsung saat context masih aktif
+                # Kasus 1: Gambar tidak mengandung teks (halaman ilustrasi / cover polos)
+                if downloaded == "NO_TEXT":
+                    target_hasil_dir = os.path.join(DIR_HASIL, rel_dir)
+                    Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
+                    success = True
+                    break
+
+                # Kasus 2: Hasil terjemahan berhasil diunduh
                 if downloaded:
                     target_hasil_dir = os.path.join(DIR_HASIL, rel_dir)
                     Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
@@ -418,6 +513,7 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
                     final_save_path = os.path.join(target_hasil_dir, safe_filename)
                     await downloaded.save_as(final_save_path)
                     success = True
+                    break
             except Exception:
                 downloaded = None
             finally:
@@ -434,6 +530,7 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
 
             if success:
                 break
+
 
         # ── Penanganan jika sukses atau gagal ──────────────────────────────────
         if success:
@@ -461,7 +558,13 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
     except Exception:
         async with lock:
             failed_files.append(file_path)
-
+    finally:
+        # Bersihkan file & folder sementara jika dibuat
+        if is_temp and os.path.exists(upload_path):
+            try:
+                shutil.rmtree(os.path.dirname(upload_path), ignore_errors=True)
+            except Exception:
+                pass
 
     # Update progress bar
     async with lock:
@@ -639,6 +742,14 @@ async def amain():
     Path(DIR_MENTAH).mkdir(exist_ok=True)
     Path(DIR_HASIL).mkdir(exist_ok=True)
     Path(DIR_SELESAI).mkdir(exist_ok=True)
+
+    # Bersihkan folder sementara jika tersisa dari sesi sebelumnya
+    if Path(TEMP_OPT_DIR).exists():
+        try:
+            shutil.rmtree(TEMP_OPT_DIR, ignore_errors=True)
+        except Exception:
+            pass
+
 
     mode_label = "Headless (Background)" if HEADLESS else "Windowed"
     console.print(Panel.fit(

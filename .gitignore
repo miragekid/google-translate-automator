@@ -1,4 +1,4 @@
-﻿# Virtual environment
+# Virtual environment
 venv/
 
 # Browser profile (sesi login, jangan di-upload)
@@ -16,3 +16,7 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Temp image optimization
+.temp_opt/
+
