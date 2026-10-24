@@ -71,9 +71,10 @@ TRANSLATE_TIMEOUT = 60     # Timeout tunggu terjemahan dalam detik (dinaikkan un
 HEADLESS     = True        # True = browser di background (hanya CLI yang tampil)
 TAB_DELAY    = 3.0         # Jeda waktu (detik) antar tab saat mulai agar tidak bersamaan
 
-# Batas ukuran gambar untuk upload Google Translate (10 MB limit)
-MAX_IMAGE_SIZE_BYTES = int(9.8 * 1024 * 1024)  # 9.8 MB untuk margin aman di bawah 10 MB
-TEMP_OPT_DIR         = ".temp_opt"             # Folder sementara untuk file yang dioptimasi
+# Batas ukuran gambar untuk upload Google Translate (5 MB untuk stabilitas OCR)
+MAX_IMAGE_SIZE_BYTES = int(5.0 * 1024 * 1024)   # 5 MB
+TEMP_OPT_DIR         = ".temp_opt"              # Folder sementara untuk file yang dioptimasi
+COPY_NO_TEXT_RAW     = False                    # False = Jangan salin file asli jika OCR gagal / tidak ada teks (mencegah file mentah masuk ke hasil)
 
 # Toleransi ukuran file untuk mendeteksi hasil "palsu" (Google Translate return file asli)
 # Jika ukuran file hasil >= X% ukuran asli, dianggap belum diterjemahkan
@@ -128,21 +129,25 @@ def _is_fake_translation(src_path: Path, hasil_path: Path) -> bool:
 
 def optimize_image_if_needed(abs_path: str, update_status) -> tuple:
     """
-    Jika file gambar berukuran > MAX_IMAGE_SIZE_BYTES (10 MB):
+    Jika file gambar berukuran > MAX_IMAGE_SIZE_BYTES (5 MB) atau PNG berukuran > 4 MB:
     1. Konversi ke format JPEG (mode RGB dengan background putih jika ada transparansi).
-    2. Jika masih >= 10 MB, resize dimensi atau turunkan kualitas secara bertahap hingga < 10 MB.
+    2. Resize dimensi maksimal 2400px dan turunkan kualitas secara bertahap hingga < 5 MB.
     Menyimpan ke folder sementara (.temp_opt) dan mengembalikan (path_file_upload, is_temp).
     """
     if not os.path.exists(abs_path):
         return abs_path, False
 
     src_size = os.path.getsize(abs_path)
-    if src_size <= MAX_IMAGE_SIZE_BYTES:
+    ext = Path(abs_path).suffix.lower()
+
+    # Cek apakah perlu optimasi (file > 5MB atau PNG > 4MB)
+    needs_opt = (src_size > MAX_IMAGE_SIZE_BYTES) or (ext == '.png' and src_size > 4 * 1024 * 1024)
+    if not needs_opt:
         return abs_path, False
 
     filename = os.path.basename(abs_path)
     stem = Path(filename).stem
-    update_status(f"[yellow]Mengoptimasi (>10MB -> JPG):[/yellow] {filename}")
+    update_status(f"[yellow]Mengoptimasi (>5MB/PNG -> JPG):[/yellow] {filename}")
 
     # Buat subfolder unik per worker untuk mencegah konflik nama file yang sama
     unique_dir = Path(TEMP_OPT_DIR) / uuid.uuid4().hex[:8]
@@ -162,9 +167,13 @@ def optimize_image_if_needed(abs_path: str, update_status) -> tuple:
             else:
                 rgb_img = img
 
-            quality = 85
+            quality = 90
             scale = 1.0
             orig_w, orig_h = rgb_img.size
+
+            # Jika dimensi terlalu besar (> 2400px), perkecil agar Google OCR lancar
+            if max(orig_w, orig_h) > 2400:
+                scale = 2400.0 / max(orig_w, orig_h)
 
             while True:
                 cur_w = max(1, int(orig_w * scale))
@@ -293,27 +302,35 @@ def restore_fake_results(fake_list: list):
 
     for src_mentah, rel, hasil_path_str in fake_list:
         hasil_path = Path(hasil_path_str)
+        rel_path = Path(rel)
+        mentah_dst = mentah_root / rel_path
+        selesai_src = selesai_root / rel_path
 
-        # 1. Hapus file palsu dari hasil
+        # 1. Pulihkan ke mentah
+        if selesai_src.exists() and not mentah_dst.exists():
+            mentah_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(selesai_src), str(mentah_dst))
+            restored += 1
+        elif Path(src_mentah).exists() and 'selesai' not in Path(src_mentah).parts:
+            # File masih di mentah, tidak perlu dipindah
+            restored += 1
+        elif hasil_path.exists() and not mentah_dst.exists():
+            # Jika di selesai tidak ada, salin kembali dari hasil sebagai sumber mentah
+            mentah_dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(str(hasil_path), str(mentah_dst))
+                restored += 1
+            except Exception as e:
+                console.print(f"[red]Gagal menyalin kembali {hasil_path.name}: {e}[/red]")
+        elif mentah_dst.exists():
+            restored += 1
+
+        # 2. Hapus file palsu dari hasil
         try:
             if hasil_path.exists():
                 hasil_path.unlink()
         except Exception as e:
             console.print(f"[red]Gagal hapus hasil palsu {hasil_path.name}: {e}[/red]")
-            continue
-
-        # 2. Jika file asli sudah dipindah ke selesai, kembalikan ke mentah
-        rel_path    = Path(rel)
-        selesai_src = selesai_root / rel_path
-        mentah_dst  = mentah_root / rel_path
-
-        if selesai_src.exists() and not mentah_dst.exists():
-            mentah_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(selesai_src), str(mentah_dst))
-            restored += 1
-        elif Path(src_mentah).exists():
-            # File masih di mentah, tidak perlu dipindah
-            restored += 1
 
     return restored
 
@@ -374,9 +391,9 @@ async def process_image_file(page, abs_path: str, rel_path: str, update_status) 
         }''')
 
         # 1. Jika Google Translate mengonfirmasi tidak ada teks yang terdeteksi
-        # (misal halaman ilustrasi murni/credits), anggap selesai tanpa perlu dipaksa translate
-        if state["noText"]:
-            update_status(f"[cyan]Tidak ada teks:[/cyan] {filename}")
+        # Butuh minimal 4 siklus (~1.6 detik) stabil dan tidak sedang proses translasi
+        if state["noText"] and not state["isTranslating"]:
+            update_status(f"[cyan]Tidak ada teks terdeteksi:[/cyan] {filename}")
             return "NO_TEXT"
 
         has_show_orig = await show_orig_btn.count() > 0 and await show_orig_btn.is_visible()
@@ -496,13 +513,17 @@ async def process_file(browser, file_path: str, source_dir: str, progress: Progr
                 else:
                     downloaded = await process_doc_file(page, abs_path, rel_path, update_status)
 
-                # Kasus 1: Gambar tidak mengandung teks (halaman ilustrasi / cover polos)
+                # Kasus 1: Gambar tidak mengandung teks
                 if downloaded == "NO_TEXT":
-                    target_hasil_dir = os.path.join(DIR_HASIL, rel_dir)
-                    Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
-                    success = True
-                    break
+                    if COPY_NO_TEXT_RAW:
+                        target_hasil_dir = os.path.join(DIR_HASIL, rel_dir)
+                        Path(target_hasil_dir).mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(file_path, os.path.join(target_hasil_dir, filename))
+                        success = True
+                        break
+                    else:
+                        update_status(f"[yellow]Tidak ada teks terdeteksi (coba lagi):[/yellow] {filename}")
+                        downloaded = None
 
                 # Kasus 2: Hasil terjemahan berhasil diunduh
                 if downloaded:
